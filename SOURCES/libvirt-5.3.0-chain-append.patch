@@ -1,0 +1,21 @@
+From: Daniel Ding <zhihui.ding@easystack.cn>
+Date: Thu, 6 Oct 2022 11:25:48 +0800
+Subject: [PATCH v1] fix: replace insert to append for pvt
+
+---
+ src/util/viriptables.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/util/viriptables.c b/src/util/viriptables.c
+index 0e3c0ad73a..eabc4cd699 100644
+--- a/src/util/viriptables.c
++++ b/src/util/viriptables.c
+@@ -114,7 +114,7 @@ iptablesPrivateChainCreate(virFirewallPtr fw,
+         if (!from || STRNEQ(from, data->chains[i].parent))
+             virFirewallAddRule(fw, layer,
+                                "--table", data->table,
+-                               "--insert", data->chains[i].parent,
++                               "--append", data->chains[i].parent,
+                                "--jump", data->chains[i].child, NULL);
+     }
+ 

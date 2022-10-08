@@ -1,0 +1,63 @@
+From a4b153795f55b303741ef4a2dd2205291ef2a79e Mon Sep 17 00:00:00 2001
+From: Jens Freimann <jfreimann@redhat.com>
+Date: Wed, 30 Jan 2019 08:19:32 -0500
+Subject: [PATCH] net/virtio: set offload flag for jumbo frames
+
+[ upstream commit 8b90e4358112b9e41f8eaa1ba14c783570307fea ]
+
+Port configuration fails because offload flags don't match the expected
+value when max-pkt-len is set to a value that should enable receive port
+offloading but doesn't.
+
+The .dev_infos_get callback can be called before the configure callback.
+At that time we don't know the maximum packet size yet because it is
+only set up when ports are started. So in virtio_dev_info_get() just
+always set the jumbo packet offload flag.
+
+Check the maximum packet length at device configure time, because then we
+have access to the max-pkt-len value provided by the user. If the
+max-pkt-len exceeds the maximum MTU supported by the device we remove
+the VIRTIO_NET_F_MTU flag from requested features.
+
+Fixes: a4996bd89c42 ("ethdev: new Rx/Tx offloads API")
+Cc: stable@dpdk.org
+
+Signed-off-by: Jens Freimann <jfreimann@redhat.com>
+---
+ drivers/net/virtio/virtio_ethdev.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/net/virtio/virtio_ethdev.c b/drivers/net/virtio/virtio_ethdev.c
+index 7c4c1df00..7c2fe76f3 100644
+--- a/drivers/net/virtio/virtio_ethdev.c
++++ b/drivers/net/virtio/virtio_ethdev.c
+@@ -1972,6 +1972,8 @@ virtio_dev_configure(struct rte_eth_dev *dev)
+ 	const struct rte_eth_rxmode *rxmode = &dev->data->dev_conf.rxmode;
+ 	const struct rte_eth_txmode *txmode = &dev->data->dev_conf.txmode;
+ 	struct virtio_hw *hw = dev->data->dev_private;
++	uint32_t ether_hdr_len = ETHER_HDR_LEN + VLAN_TAG_LEN +
++		hw->vtnet_hdr_size;
+ 	uint64_t rx_offloads = rxmode->offloads;
+ 	uint64_t tx_offloads = txmode->offloads;
+ 	uint64_t req_features;
+@@ -1986,6 +1988,9 @@ virtio_dev_configure(struct rte_eth_dev *dev)
+ 			return ret;
+ 	}
+ 
++	if (rxmode->max_rx_pkt_len > hw->max_mtu + ether_hdr_len)
++		req_features &= ~(1ULL << VIRTIO_NET_F_MTU);
++
+ 	if (rx_offloads & (DEV_RX_OFFLOAD_UDP_CKSUM |
+ 			   DEV_RX_OFFLOAD_TCP_CKSUM))
+ 		req_features |= (1ULL << VIRTIO_NET_F_GUEST_CSUM);
+@@ -2339,6 +2344,7 @@ virtio_dev_info_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info)
+ 
+ 	host_features = VTPCI_OPS(hw)->get_features(hw);
+ 	dev_info->rx_offload_capa = DEV_RX_OFFLOAD_VLAN_STRIP;
++	dev_info->rx_offload_capa |= DEV_RX_OFFLOAD_JUMBO_FRAME;
+ 	if (host_features & (1ULL << VIRTIO_NET_F_GUEST_CSUM)) {
+ 		dev_info->rx_offload_capa |=
+ 			DEV_RX_OFFLOAD_TCP_CKSUM |
+-- 
+2.20.1
+
