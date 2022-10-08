@@ -1,0 +1,267 @@
+From a6fc8e35d9e72b2acd605b6c6a8b08d2541c0609 Mon Sep 17 00:00:00 2001
+From: Ben Walker <benjamin.walker@intel.com>
+Date: Fri, 14 Jun 2019 11:39:16 +0200
+Subject: [PATCH 1/4] eal: compute IOVA mode based on PA availability
+
+Currently, if the bus selects IOVA as PA, the memory init can fail when
+lacking access to physical addresses.
+This can be quite hard for normal users to understand what is wrong
+since this is the default behavior.
+
+Catch this situation earlier in eal init by validating physical addresses
+availability, or select IOVA when no clear preferrence had been expressed.
+
+The bus code is changed so that it reports when it does not care about
+the IOVA mode and let the eal init decide.
+
+In Linux implementation, rework rte_eal_using_phys_addrs() so that it can
+be called earlier but still avoid a circular dependency with
+rte_mem_virt2phys().
+In FreeBSD implementation, rte_eal_using_phys_addrs() always returns
+false, so the detection part is left as is.
+
+If librte_kni is compiled in and the KNI kmod is loaded,
+- if the buses requested VA, force to PA if physical addresses are
+  available as it was done before,
+- else, keep iova as VA, KNI init will fail later.
+
+Signed-off-by: Ben Walker <benjamin.walker@intel.com>
+Signed-off-by: David Marchand <david.marchand@redhat.com>
+Acked-by: Anatoly Burakov <anatoly.burakov@intel.com>
+
+(cherry picked from commit c2361bab70c56f64e50f07946b1b20bf688d782a)
+Signed-off-by: David Marchand <david.marchand@redhat.com>
+---
+ lib/librte_eal/bsdapp/eal/eal.c          | 10 +++++--
+ lib/librte_eal/common/eal_common_bus.c   |  4 ---
+ lib/librte_eal/common/include/rte_bus.h  |  2 +-
+ lib/librte_eal/linuxapp/eal/eal.c        | 38 ++++++++++++++++++++------
+ lib/librte_eal/linuxapp/eal/eal_memory.c | 46 +++++++++-----------------------
+ 5 files changed, 51 insertions(+), 49 deletions(-)
+
+diff --git a/lib/librte_eal/bsdapp/eal/eal.c b/lib/librte_eal/bsdapp/eal/eal.c
+index bfac7fd..14ae853 100644
+--- a/lib/librte_eal/bsdapp/eal/eal.c
++++ b/lib/librte_eal/bsdapp/eal/eal.c
+@@ -689,13 +689,19 @@ rte_eal_init(int argc, char **argv)
+ 	/* if no EAL option "--iova-mode=<pa|va>", use bus IOVA scheme */
+ 	if (internal_config.iova_mode == RTE_IOVA_DC) {
+ 		/* autodetect the IOVA mapping mode (default is RTE_IOVA_PA) */
+-		rte_eal_get_configuration()->iova_mode =
+-			rte_bus_get_iommu_class();
++		enum rte_iova_mode iova_mode = rte_bus_get_iommu_class();
++
++		if (iova_mode == RTE_IOVA_DC)
++			iova_mode = RTE_IOVA_PA;
++		rte_eal_get_configuration()->iova_mode = iova_mode;
+ 	} else {
+ 		rte_eal_get_configuration()->iova_mode =
+ 			internal_config.iova_mode;
+ 	}
+ 
++	RTE_LOG(INFO, EAL, "Selected IOVA mode '%s'\n",
++		rte_eal_iova_mode() == RTE_IOVA_PA ? "PA" : "VA");
++
+ 	if (internal_config.no_hugetlbfs == 0) {
+ 		/* rte_config isn't initialized yet */
+ 		ret = internal_config.process_type == RTE_PROC_PRIMARY ?
+diff --git a/lib/librte_eal/common/eal_common_bus.c b/lib/librte_eal/common/eal_common_bus.c
+index c8f1901..77f1be1 100644
+--- a/lib/librte_eal/common/eal_common_bus.c
++++ b/lib/librte_eal/common/eal_common_bus.c
+@@ -237,10 +237,6 @@ rte_bus_get_iommu_class(void)
+ 			mode |= bus->get_iommu_class();
+ 	}
+ 
+-	if (mode != RTE_IOVA_VA) {
+-		/* Use default IOVA mode */
+-		mode = RTE_IOVA_PA;
+-	}
+ 	return mode;
+ }
+ 
+diff --git a/lib/librte_eal/common/include/rte_bus.h b/lib/librte_eal/common/include/rte_bus.h
+index 6be4b5c..b87e23b 100644
+--- a/lib/librte_eal/common/include/rte_bus.h
++++ b/lib/librte_eal/common/include/rte_bus.h
+@@ -348,7 +348,7 @@ struct rte_bus *rte_bus_find_by_name(const char *busname);
+ 
+ /**
+  * Get the common iommu class of devices bound on to buses available in the
+- * system. The default mode is PA.
++ * system. RTE_IOVA_DC means that no preferrence has been expressed.
+  *
+  * @return
+  *     enum rte_iova_mode value.
+diff --git a/lib/librte_eal/linuxapp/eal/eal.c b/lib/librte_eal/linuxapp/eal/eal.c
+index 7a08cf1..6899307 100644
+--- a/lib/librte_eal/linuxapp/eal/eal.c
++++ b/lib/librte_eal/linuxapp/eal/eal.c
+@@ -943,6 +943,7 @@ rte_eal_init(int argc, char **argv)
+ 	static char logid[PATH_MAX];
+ 	char cpuset[RTE_CPU_AFFINITY_STR_LEN];
+ 	char thread_name[RTE_MAX_THREAD_NAME_LEN];
++	bool phys_addrs;
+ 
+ 	/* checks if the machine is adequate */
+ 	if (!rte_cpu_is_supported()) {
+@@ -1030,25 +1031,46 @@ rte_eal_init(int argc, char **argv)
+ 		return -1;
+ 	}
+ 
++	phys_addrs = rte_eal_using_phys_addrs() != 0;
++
+ 	/* if no EAL option "--iova-mode=<pa|va>", use bus IOVA scheme */
+ 	if (internal_config.iova_mode == RTE_IOVA_DC) {
+-		/* autodetect the IOVA mapping mode (default is RTE_IOVA_PA) */
+-		rte_eal_get_configuration()->iova_mode =
+-			rte_bus_get_iommu_class();
++		/* autodetect the IOVA mapping mode */
++		enum rte_iova_mode iova_mode = rte_bus_get_iommu_class();
+ 
++		if (iova_mode == RTE_IOVA_DC) {
++			iova_mode = phys_addrs ? RTE_IOVA_PA : RTE_IOVA_VA;
++			RTE_LOG(DEBUG, EAL,
++				"Buses did not request a specific IOVA mode, using '%s' based on physical addresses availability.\n",
++				phys_addrs ? "PA" : "VA");
++		}
++#ifdef RTE_LIBRTE_KNI
+ 		/* Workaround for KNI which requires physical address to work */
+-		if (rte_eal_get_configuration()->iova_mode == RTE_IOVA_VA &&
++		if (iova_mode == RTE_IOVA_VA &&
+ 				rte_eal_check_module("rte_kni") == 1) {
+-			rte_eal_get_configuration()->iova_mode = RTE_IOVA_PA;
+-			RTE_LOG(WARNING, EAL,
+-				"Some devices want IOVA as VA but PA will be used because.. "
+-				"KNI module inserted\n");
++			if (phys_addrs) {
++				iova_mode = RTE_IOVA_PA;
++				RTE_LOG(WARNING, EAL, "Forcing IOVA as 'PA' because KNI module is loaded\n");
++			} else {
++				RTE_LOG(DEBUG, EAL, "KNI can not work since physical addresses are unavailable\n");
++			}
+ 		}
++#endif
++		rte_eal_get_configuration()->iova_mode = iova_mode;
+ 	} else {
+ 		rte_eal_get_configuration()->iova_mode =
+ 			internal_config.iova_mode;
+ 	}
+ 
++	if (rte_eal_iova_mode() == RTE_IOVA_PA && !phys_addrs) {
++		rte_eal_init_alert("Cannot use IOVA as 'PA' since physical addresses are not available");
++		rte_errno = EINVAL;
++		return -1;
++	}
++
++	RTE_LOG(INFO, EAL, "Selected IOVA mode '%s'\n",
++		rte_eal_iova_mode() == RTE_IOVA_PA ? "PA" : "VA");
++
+ 	if (internal_config.no_hugetlbfs == 0) {
+ 		/* rte_config isn't initialized yet */
+ 		ret = internal_config.process_type == RTE_PROC_PRIMARY ?
+diff --git a/lib/librte_eal/linuxapp/eal/eal_memory.c b/lib/librte_eal/linuxapp/eal/eal_memory.c
+index 898bdb7..24d99c0 100644
+--- a/lib/librte_eal/linuxapp/eal/eal_memory.c
++++ b/lib/librte_eal/linuxapp/eal/eal_memory.c
+@@ -62,34 +62,10 @@
+  * zone as well as a physical contiguous zone.
+  */
+ 
+-static bool phys_addrs_available = true;
++static int phys_addrs_available = -1;
+ 
+ #define RANDOMIZE_VA_SPACE_FILE "/proc/sys/kernel/randomize_va_space"
+ 
+-static void
+-test_phys_addrs_available(void)
+-{
+-	uint64_t tmp = 0;
+-	phys_addr_t physaddr;
+-
+-	if (!rte_eal_has_hugepages()) {
+-		RTE_LOG(ERR, EAL,
+-			"Started without hugepages support, physical addresses not available\n");
+-		phys_addrs_available = false;
+-		return;
+-	}
+-
+-	physaddr = rte_mem_virt2phy(&tmp);
+-	if (physaddr == RTE_BAD_PHYS_ADDR) {
+-		if (rte_eal_iova_mode() == RTE_IOVA_PA)
+-			RTE_LOG(ERR, EAL,
+-				"Cannot obtain physical addresses: %s. "
+-				"Only vfio will function.\n",
+-				strerror(errno));
+-		phys_addrs_available = false;
+-	}
+-}
+-
+ /*
+  * Get physical address of any mapped virtual address in the current process.
+  */
+@@ -102,8 +78,7 @@ rte_mem_virt2phy(const void *virtaddr)
+ 	int page_size;
+ 	off_t offset;
+ 
+-	/* Cannot parse /proc/self/pagemap, no need to log errors everywhere */
+-	if (!phys_addrs_available)
++	if (phys_addrs_available == 0)
+ 		return RTE_BAD_IOVA;
+ 
+ 	/* standard page size */
+@@ -1332,8 +1307,6 @@ eal_legacy_hugepage_init(void)
+ 	int nr_hugefiles, nr_hugepages = 0;
+ 	void *addr;
+ 
+-	test_phys_addrs_available();
+-
+ 	memset(used_hp, 0, sizeof(used_hp));
+ 
+ 	/* get pointer to global configuration */
+@@ -1466,7 +1439,7 @@ eal_legacy_hugepage_init(void)
+ 				continue;
+ 		}
+ 
+-		if (phys_addrs_available &&
++		if (rte_eal_using_phys_addrs() &&
+ 				rte_eal_iova_mode() != RTE_IOVA_VA) {
+ 			/* find physical addresses for each hugepage */
+ 			if (find_physaddrs(&tmp_hp[hp_offset], hpi) < 0) {
+@@ -1685,8 +1658,6 @@ eal_hugepage_init(void)
+ 	uint64_t memory[RTE_MAX_NUMA_NODES];
+ 	int hp_sz_idx, socket_id;
+ 
+-	test_phys_addrs_available();
+-
+ 	memset(used_hp, 0, sizeof(used_hp));
+ 
+ 	for (hp_sz_idx = 0;
+@@ -1812,8 +1783,6 @@ eal_legacy_hugepage_attach(void)
+ 				"into secondary processes\n");
+ 	}
+ 
+-	test_phys_addrs_available();
+-
+ 	fd_hugepage = open(eal_hugepage_data_path(), O_RDONLY);
+ 	if (fd_hugepage < 0) {
+ 		RTE_LOG(ERR, EAL, "Could not open %s\n",
+@@ -1953,6 +1922,15 @@ rte_eal_hugepage_attach(void)
+ int
+ rte_eal_using_phys_addrs(void)
+ {
++	if (phys_addrs_available == -1) {
++		uint64_t tmp = 0;
++
++		if (rte_eal_has_hugepages() != 0 &&
++		    rte_mem_virt2phy(&tmp) != RTE_BAD_PHYS_ADDR)
++			phys_addrs_available = 1;
++		else
++			phys_addrs_available = 0;
++	}
+ 	return phys_addrs_available;
+ }
+ 
+-- 
+1.8.3.1
+

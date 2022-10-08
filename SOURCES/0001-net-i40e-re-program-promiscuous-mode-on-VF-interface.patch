@@ -1,0 +1,71 @@
+From b6cf6a0100ce9645a74a23bbeeff4083e80d8a39 Mon Sep 17 00:00:00 2001
+Message-Id: <b6cf6a0100ce9645a74a23bbeeff4083e80d8a39.1577094089.git.echaudro@redhat.com>
+From: Eelco Chaudron <echaudro@redhat.com>
+Date: Tue, 19 Nov 2019 08:45:21 -0500
+Subject: [PATCH] net/i40e: re-program promiscuous mode on VF interface
+
+During a kernel PF reset, this event is propagated to the VF.
+The DPDK VF PMD will execute the reset task before the PF is done
+with his. This results in the admin queue message not being responded
+to leaving the port in "promiscuous" mode.
+
+This patch makes sure the promiscuous mode is configured independently
+of the current admin state.
+
+Signed-off-by: Eelco Chaudron <echaudro@redhat.com>
+Reviewed-by: Xiao Zhang <xiao.zhang@intel.com>
+---
+ drivers/net/i40e/i40e_ethdev_vf.c | 16 ----------------
+ 1 file changed, 16 deletions(-)
+
+diff --git a/drivers/net/i40e/i40e_ethdev_vf.c b/drivers/net/i40e/i40e_ethdev_vf.c
+index 5dba092..43f7ab5 100644
+--- a/drivers/net/i40e/i40e_ethdev_vf.c
++++ b/drivers/net/i40e/i40e_ethdev_vf.c
+@@ -2092,10 +2092,6 @@ static int eth_i40evf_pci_remove(struct rte_pci_device *pci_dev)
+ 	struct i40e_vf *vf = I40EVF_DEV_PRIVATE_TO_VF(dev->data->dev_private);
+ 	int ret;
+ 
+-	/* If enabled, just return */
+-	if (vf->promisc_unicast_enabled)
+-		return;
+-
+ 	ret = i40evf_config_promisc(dev, 1, vf->promisc_multicast_enabled);
+ 	if (ret == 0)
+ 		vf->promisc_unicast_enabled = TRUE;
+@@ -2107,10 +2103,6 @@ static int eth_i40evf_pci_remove(struct rte_pci_device *pci_dev)
+ 	struct i40e_vf *vf = I40EVF_DEV_PRIVATE_TO_VF(dev->data->dev_private);
+ 	int ret;
+ 
+-	/* If disabled, just return */
+-	if (!vf->promisc_unicast_enabled)
+-		return;
+-
+ 	ret = i40evf_config_promisc(dev, 0, vf->promisc_multicast_enabled);
+ 	if (ret == 0)
+ 		vf->promisc_unicast_enabled = FALSE;
+@@ -2122,10 +2114,6 @@ static int eth_i40evf_pci_remove(struct rte_pci_device *pci_dev)
+ 	struct i40e_vf *vf = I40EVF_DEV_PRIVATE_TO_VF(dev->data->dev_private);
+ 	int ret;
+ 
+-	/* If enabled, just return */
+-	if (vf->promisc_multicast_enabled)
+-		return;
+-
+ 	ret = i40evf_config_promisc(dev, vf->promisc_unicast_enabled, 1);
+ 	if (ret == 0)
+ 		vf->promisc_multicast_enabled = TRUE;
+@@ -2137,10 +2125,6 @@ static int eth_i40evf_pci_remove(struct rte_pci_device *pci_dev)
+ 	struct i40e_vf *vf = I40EVF_DEV_PRIVATE_TO_VF(dev->data->dev_private);
+ 	int ret;
+ 
+-	/* If enabled, just return */
+-	if (!vf->promisc_multicast_enabled)
+-		return;
+-
+ 	ret = i40evf_config_promisc(dev, vf->promisc_unicast_enabled, 0);
+ 	if (ret == 0)
+ 		vf->promisc_multicast_enabled = FALSE;
+-- 
+1.8.3.1
+

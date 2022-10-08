@@ -1,0 +1,164 @@
+From 3729b66e42e1a11bdd3ee080a86c07adede8b3b2 Mon Sep 17 00:00:00 2001
+From: David Marchand <david.marchand@redhat.com>
+Date: Mon, 5 Aug 2019 08:23:26 +0200
+Subject: [PATCH 4/4] bus/pci: always check IOMMU capabilities
+
+IOMMU capabilities won't change and must be checked even if no PCI device
+seem to be supported yet when EAL initialised.
+
+This is to accommodate with SPDK that registers its drivers after
+rte_eal_init(), especially on PPC platform where the IOMMU does not
+support VA.
+
+Fixes: 703458e19c16 ("bus/pci: consider only usable devices for IOVA mode")
+
+Signed-off-by: David Marchand <david.marchand@redhat.com>
+Reviewed-by: David Christensen <drc@linux.vnet.ibm.com>
+Acked-by: Jerin Jacob <jerinj@marvell.com>
+Tested-by: Jerin Jacob <jerinj@marvell.com>
+Tested-by: Takeshi Yoshimura <tyos@jp.ibm.com>
+
+(cherry picked from commit 66d3724b2c87e6fcdf3851ca191683696a91b901)
+Signed-off-by: David Marchand <david.marchand@redhat.com>
+---
+ drivers/bus/pci/bsd/pci.c    |  6 ++++++
+ drivers/bus/pci/linux/pci.c  | 25 ++++++-------------------
+ drivers/bus/pci/pci_common.c | 16 +++++++++++++++-
+ drivers/bus/pci/private.h    |  5 ++++-
+ 4 files changed, 31 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/bus/pci/bsd/pci.c b/drivers/bus/pci/bsd/pci.c
+index 0f23f12..42f4353 100644
+--- a/drivers/bus/pci/bsd/pci.c
++++ b/drivers/bus/pci/bsd/pci.c
+@@ -376,6 +376,12 @@ error:
+ 	return -1;
+ }
+ 
++bool
++pci_device_iommu_support_va(__rte_unused const struct rte_pci_device *dev)
++{
++	return false;
++}
++
+ enum rte_iova_mode
+ pci_device_iova_mode(const struct rte_pci_driver *pdrv __rte_unused,
+ 		     const struct rte_pci_device *pdev)
+diff --git a/drivers/bus/pci/linux/pci.c b/drivers/bus/pci/linux/pci.c
+index 1a2f99b..6a6f78b 100644
+--- a/drivers/bus/pci/linux/pci.c
++++ b/drivers/bus/pci/linux/pci.c
+@@ -498,8 +498,8 @@ error:
+ }
+ 
+ #if defined(RTE_ARCH_X86)
+-static bool
+-pci_one_device_iommu_support_va(const struct rte_pci_device *dev)
++bool
++pci_device_iommu_support_va(const struct rte_pci_device *dev)
+ {
+ #define VTD_CAP_MGAW_SHIFT	16
+ #define VTD_CAP_MGAW_MASK	(0x3fULL << VTD_CAP_MGAW_SHIFT)
+@@ -547,14 +547,14 @@ pci_one_device_iommu_support_va(const struct rte_pci_device *dev)
+ 	return true;
+ }
+ #elif defined(RTE_ARCH_PPC_64)
+-static bool
+-pci_one_device_iommu_support_va(__rte_unused const struct rte_pci_device *dev)
++bool
++pci_device_iommu_support_va(__rte_unused const struct rte_pci_device *dev)
+ {
+ 	return false;
+ }
+ #else
+-static bool
+-pci_one_device_iommu_support_va(__rte_unused const struct rte_pci_device *dev)
++bool
++pci_device_iommu_support_va(__rte_unused const struct rte_pci_device *dev)
+ {
+ 	return true;
+ }
+@@ -565,7 +565,6 @@ pci_device_iova_mode(const struct rte_pci_driver *pdrv,
+ 		     const struct rte_pci_device *pdev)
+ {
+ 	enum rte_iova_mode iova_mode = RTE_IOVA_DC;
+-	static int iommu_no_va = -1;
+ 
+ 	switch (pdev->kdrv) {
+ 	case RTE_KDRV_VFIO: {
+@@ -596,18 +595,6 @@ pci_device_iova_mode(const struct rte_pci_driver *pdrv,
+ 			iova_mode = RTE_IOVA_VA;
+ 		break;
+ 	}
+-
+-	if (iova_mode != RTE_IOVA_PA) {
+-		/*
+-		 * We can check this only once, because the IOMMU hardware is
+-		 * the same for all of them.
+-		 */
+-		if (iommu_no_va == -1)
+-			iommu_no_va = pci_one_device_iommu_support_va(pdev)
+-					? 0 : 1;
+-		if (iommu_no_va != 0)
+-			iova_mode = RTE_IOVA_PA;
+-	}
+ 	return iova_mode;
+ }
+ 
+diff --git a/drivers/bus/pci/pci_common.c b/drivers/bus/pci/pci_common.c
+index ee5d321..9e7106f 100644
+--- a/drivers/bus/pci/pci_common.c
++++ b/drivers/bus/pci/pci_common.c
+@@ -570,8 +570,16 @@ rte_pci_get_iommu_class(void)
+ 	const struct rte_pci_driver *drv;
+ 	bool devices_want_va = false;
+ 	bool devices_want_pa = false;
++	int iommu_no_va = -1;
+ 
+ 	FOREACH_DEVICE_ON_PCIBUS(dev) {
++		/*
++		 * We can check this only once, because the IOMMU hardware is
++		 * the same for all of them.
++		 */
++		if (iommu_no_va == -1)
++			iommu_no_va = pci_device_iommu_support_va(dev)
++					? 0 : 1;
+ 		if (pci_ignore_device(dev))
+ 			continue;
+ 		if (dev->kdrv == RTE_KDRV_UNKNOWN ||
+@@ -597,7 +605,13 @@ rte_pci_get_iommu_class(void)
+ 				devices_want_va = true;
+ 		}
+ 	}
+-	if (devices_want_va && !devices_want_pa) {
++	if (iommu_no_va == 1) {
++		iova_mode = RTE_IOVA_PA;
++		if (devices_want_va) {
++			RTE_LOG(WARNING, EAL, "Some devices want 'VA' but IOMMU does not support 'VA'.\n");
++			RTE_LOG(WARNING, EAL, "The devices that want 'VA' won't initialize.\n");
++		}
++	} else if (devices_want_va && !devices_want_pa) {
+ 		iova_mode = RTE_IOVA_VA;
+ 	} else if (devices_want_pa && !devices_want_va) {
+ 		iova_mode = RTE_IOVA_PA;
+diff --git a/drivers/bus/pci/private.h b/drivers/bus/pci/private.h
+index 8a55240..a205d4d 100644
+--- a/drivers/bus/pci/private.h
++++ b/drivers/bus/pci/private.h
+@@ -173,9 +173,12 @@ rte_pci_match(const struct rte_pci_driver *pci_drv,
+ 	      const struct rte_pci_device *pci_dev);
+ 
+ /**
+- * OS specific callback for rte_pci_get_iommu_class
++ * OS specific callbacks for rte_pci_get_iommu_class
+  *
+  */
++bool
++pci_device_iommu_support_va(const struct rte_pci_device *dev);
++
+ enum rte_iova_mode
+ pci_device_iova_mode(const struct rte_pci_driver *pci_drv,
+ 		     const struct rte_pci_device *pci_dev);
+-- 
+1.8.3.1
+

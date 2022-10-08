@@ -1,0 +1,83 @@
+From 039253166a57ee660dd2fbe92ca77fa65154751c Mon Sep 17 00:00:00 2001
+Message-Id: <039253166a57ee660dd2fbe92ca77fa65154751c.1577105865.git.echaudro@redhat.com>
+From: Eelco Chaudron <echaudro@redhat.com>
+Date: Wed, 28 Aug 2019 10:49:39 -0400
+Subject: [PATCH] vhost: add device op when notification to guest is sent
+
+This patch adds an operation callback which gets called every time
+the library is waking up the guest trough an eventfd_write() call.
+
+This can be used by 3rd party application, like OVS, to track the
+number of times interrupts where generated. This might be of
+interest to find out system-call were called in the fast path.
+
+Signed-off-by: Eelco Chaudron <echaudro@redhat.com>
+Reviewed-by: Maxime Coquelin <maxime.coquelin@redhat.com>
+---
+ lib/librte_vhost/rte_vhost.h | 10 +++++++++-
+ lib/librte_vhost/vhost.h     | 15 ++++++++++++---
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/lib/librte_vhost/rte_vhost.h b/lib/librte_vhost/rte_vhost.h
+index 7fb1729..878e339 100644
+--- a/lib/librte_vhost/rte_vhost.h
++++ b/lib/librte_vhost/rte_vhost.h
+@@ -172,7 +172,15 @@ struct vhost_device_ops {
+ 	int (*new_connection)(int vid);
+ 	void (*destroy_connection)(int vid);
+ 
+-	void *reserved[2]; /**< Reserved for future extension */
++	/**
++	 * This callback gets called each time a guest gets notified
++	 * about waiting packets. This is the interrupt handling trough
++	 * the eventfd_write(callfd), which can be used for counting these
++	 * "slow" syscalls.
++	 */
++	void (*guest_notified)(int vid);
++
++	void *reserved[1]; /**< Reserved for future extension */
+ };
+ 
+ /**
+diff --git a/lib/librte_vhost/vhost.h b/lib/librte_vhost/vhost.h
+index 884befa..5131a97 100644
+--- a/lib/librte_vhost/vhost.h
++++ b/lib/librte_vhost/vhost.h
+@@ -543,13 +543,19 @@ void *vhost_alloc_copy_ind_table(struct virtio_net *dev,
+ 
+ 		if ((vhost_need_event(vhost_used_event(vq), new, old) &&
+ 					(vq->callfd >= 0)) ||
+-				unlikely(!signalled_used_valid))
++				unlikely(!signalled_used_valid)) {
+ 			eventfd_write(vq->callfd, (eventfd_t) 1);
++			if (dev->notify_ops->guest_notified)
++				dev->notify_ops->guest_notified(dev->vid);
++		}
+ 	} else {
+ 		/* Kick the guest if necessary. */
+ 		if (!(vq->avail->flags & VRING_AVAIL_F_NO_INTERRUPT)
+-				&& (vq->callfd >= 0))
++				&& (vq->callfd >= 0)) {
+ 			eventfd_write(vq->callfd, (eventfd_t)1);
++			if (dev->notify_ops->guest_notified)
++				dev->notify_ops->guest_notified(dev->vid);
++		}
+ 	}
+ }
+ 
+@@ -600,8 +606,11 @@ void *vhost_alloc_copy_ind_table(struct virtio_net *dev,
+ 	if (vhost_need_event(off, new, old))
+ 		kick = true;
+ kick:
+-	if (kick)
++	if (kick) {
+ 		eventfd_write(vq->callfd, (eventfd_t)1);
++		if (dev->notify_ops->guest_notified)
++			dev->notify_ops->guest_notified(dev->vid);
++	}
+ }
+ 
+ static __rte_always_inline void
+-- 
+1.8.3.1
+

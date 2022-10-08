@@ -1,0 +1,461 @@
+From 6054dd5fe1750b52381b9ee83858fe8db1765179 Mon Sep 17 00:00:00 2001
+From: David Marchand <david.marchand@redhat.com>
+Date: Mon, 22 Jul 2019 14:56:51 +0200
+Subject: [PATCH 3/4] eal: fix IOVA mode selection as VA for PCI drivers
+
+The incriminated commit broke the use of RTE_PCI_DRV_IOVA_AS_VA which
+was intended to mean "driver only supports VA" but had been understood
+as "driver supports both PA and VA" by most net drivers and used to let
+dpdk processes to run as non root (which do not have access to physical
+addresses on recent kernels).
+
+The check on physical addresses actually closed the gap for those
+drivers. We don't need to mark them with RTE_PCI_DRV_IOVA_AS_VA and this
+flag can retain its intended meaning.
+Document explicitly its meaning.
+
+We can check that a driver requirement wrt to IOVA mode is fulfilled
+before trying to probe a device.
+
+Finally, document the heuristic used to select the IOVA mode and hope
+that we won't break it again.
+
+Fixes: 703458e19c16 ("bus/pci: consider only usable devices for IOVA mode")
+
+Signed-off-by: David Marchand <david.marchand@redhat.com>
+Reviewed-by: Jerin Jacob <jerinj@marvell.com>
+Tested-by: Jerin Jacob <jerinj@marvell.com>
+Acked-by: Anatoly Burakov <anatoly.burakov@intel.com>
+
+(cherry picked from commit b76fafb174d2cd5247c3573bb3d49444e195e760)
+Signed-off-by: David Marchand <david.marchand@redhat.com>
+
+Conflicts:
+	drivers/net/avf/avf_ethdev.c
+	drivers/net/ice/ice_ethdev.c
+	drivers/net/mlx4/mlx4.c
+	drivers/net/mlx5/mlx5.c
+	drivers/net/octeontx2/otx2_ethdev.c
+	drivers/raw/ioat/ioat_rawdev.c
+---
+ doc/guides/prog_guide/env_abstraction_layer.rst | 31 +++++++++++++++++++++++++
+ drivers/bus/pci/linux/pci.c                     | 16 +++++--------
+ drivers/bus/pci/pci_common.c                    | 30 +++++++++++++++++++-----
+ drivers/bus/pci/rte_bus_pci.h                   |  4 ++--
+ drivers/net/atlantic/atl_ethdev.c               |  3 +--
+ drivers/net/avf/avf_ethdev.c                    |  3 +--
+ drivers/net/bnxt/bnxt_ethdev.c                  |  3 +--
+ drivers/net/e1000/em_ethdev.c                   |  3 +--
+ drivers/net/e1000/igb_ethdev.c                  |  5 ++--
+ drivers/net/enic/enic_ethdev.c                  |  3 +--
+ drivers/net/fm10k/fm10k_ethdev.c                |  3 +--
+ drivers/net/i40e/i40e_ethdev.c                  |  3 +--
+ drivers/net/i40e/i40e_ethdev_vf.c               |  2 +-
+ drivers/net/ixgbe/ixgbe_ethdev.c                |  5 ++--
+ drivers/net/nfp/nfp_net.c                       |  6 ++---
+ drivers/net/qede/qede_ethdev.c                  |  6 ++---
+ lib/librte_eal/common/eal_common_bus.c          | 30 +++++++++++++++++++++---
+ 17 files changed, 106 insertions(+), 50 deletions(-)
+
+diff --git a/doc/guides/prog_guide/env_abstraction_layer.rst b/doc/guides/prog_guide/env_abstraction_layer.rst
+index 2bb77b0..a29a435 100644
+--- a/doc/guides/prog_guide/env_abstraction_layer.rst
++++ b/doc/guides/prog_guide/env_abstraction_layer.rst
+@@ -344,6 +344,37 @@ Misc Functions
+ 
+ Locks and atomic operations are per-architecture (i686 and x86_64).
+ 
++IOVA Mode Detection
++~~~~~~~~~~~~~~~~~~~
++
++IOVA Mode is selected by considering what the current usable Devices on the
++system require and/or support.
++
++Below is the 2-step heuristic for this choice.
++
++For the first step, EAL asks each bus its requirement in terms of IOVA mode
++and decides on a preferred IOVA mode.
++
++- if all buses report RTE_IOVA_PA, then the preferred IOVA mode is RTE_IOVA_PA,
++- if all buses report RTE_IOVA_VA, then the preferred IOVA mode is RTE_IOVA_VA,
++- if all buses report RTE_IOVA_DC, no bus expressed a preferrence, then the
++  preferred mode is RTE_IOVA_DC,
++- if the buses disagree (at least one wants RTE_IOVA_PA and at least one wants
++  RTE_IOVA_VA), then the preferred IOVA mode is RTE_IOVA_DC (see below with the
++  check on Physical Addresses availability),
++
++The second step checks if the preferred mode complies with the Physical
++Addresses availability since those are only available to root user in recent
++kernels.
++
++- if the preferred mode is RTE_IOVA_PA but there is no access to Physical
++  Addresses, then EAL init fails early, since later probing of the devices
++  would fail anyway,
++- if the preferred mode is RTE_IOVA_DC then based on the Physical Addresses
++  availability, the preferred mode is adjusted to RTE_IOVA_PA or RTE_IOVA_VA.
++  In the case when the buses had disagreed on the IOVA Mode at the first step,
++  part of the buses won't work because of this decision.
++
+ IOVA Mode Configuration
+ ~~~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/drivers/bus/pci/linux/pci.c b/drivers/bus/pci/linux/pci.c
+index b12f10a..1a2f99b 100644
+--- a/drivers/bus/pci/linux/pci.c
++++ b/drivers/bus/pci/linux/pci.c
+@@ -578,12 +578,10 @@ pci_device_iova_mode(const struct rte_pci_driver *pdrv,
+ 			else
+ 				is_vfio_noiommu_enabled = 0;
+ 		}
+-		if ((pdrv->drv_flags & RTE_PCI_DRV_IOVA_AS_VA) == 0) {
++		if (is_vfio_noiommu_enabled != 0)
+ 			iova_mode = RTE_IOVA_PA;
+-		} else if (is_vfio_noiommu_enabled != 0) {
+-			RTE_LOG(DEBUG, EAL, "Forcing to 'PA', vfio-noiommu mode configured\n");
+-			iova_mode = RTE_IOVA_PA;
+-		}
++		else if ((pdrv->drv_flags & RTE_PCI_DRV_IOVA_AS_VA) != 0)
++			iova_mode = RTE_IOVA_VA;
+ #endif
+ 		break;
+ 	}
+@@ -594,8 +592,8 @@ pci_device_iova_mode(const struct rte_pci_driver *pdrv,
+ 		break;
+ 
+ 	default:
+-		RTE_LOG(DEBUG, EAL, "Unsupported kernel driver? Defaulting to IOVA as 'PA'\n");
+-		iova_mode = RTE_IOVA_PA;
++		if ((pdrv->drv_flags & RTE_PCI_DRV_IOVA_AS_VA) != 0)
++			iova_mode = RTE_IOVA_VA;
+ 		break;
+ 	}
+ 
+@@ -607,10 +605,8 @@ pci_device_iova_mode(const struct rte_pci_driver *pdrv,
+ 		if (iommu_no_va == -1)
+ 			iommu_no_va = pci_one_device_iommu_support_va(pdev)
+ 					? 0 : 1;
+-		if (iommu_no_va != 0) {
+-			RTE_LOG(DEBUG, EAL, "Forcing to 'PA', IOMMU does not support IOVA as 'VA'\n");
++		if (iommu_no_va != 0)
+ 			iova_mode = RTE_IOVA_PA;
+-		}
+ 	}
+ 	return iova_mode;
+ }
+diff --git a/drivers/bus/pci/pci_common.c b/drivers/bus/pci/pci_common.c
+index b8cc6d3..ee5d321 100644
+--- a/drivers/bus/pci/pci_common.c
++++ b/drivers/bus/pci/pci_common.c
+@@ -169,8 +169,22 @@ rte_pci_probe_one_driver(struct rte_pci_driver *dr,
+ 	 * This needs to be before rte_pci_map_device(), as it enables to use
+ 	 * driver flags for adjusting configuration.
+ 	 */
+-	if (!already_probed)
++	if (!already_probed) {
++		enum rte_iova_mode dev_iova_mode;
++		enum rte_iova_mode iova_mode;
++
++		dev_iova_mode = pci_device_iova_mode(dr, dev);
++		iova_mode = rte_eal_iova_mode();
++		if (dev_iova_mode != RTE_IOVA_DC &&
++		    dev_iova_mode != iova_mode) {
++			RTE_LOG(ERR, EAL, "  Expecting '%s' IOVA mode but current mode is '%s', not initializing\n",
++				dev_iova_mode == RTE_IOVA_PA ? "PA" : "VA",
++				iova_mode == RTE_IOVA_PA ? "PA" : "VA");
++			return -EINVAL;
++		}
++
+ 		dev->driver = dr;
++	}
+ 
+ 	if (!already_probed && (dr->drv_flags & RTE_PCI_DRV_NEED_MAPPING)) {
+ 		/* map resources for devices that use igb_uio */
+@@ -583,12 +597,16 @@ rte_pci_get_iommu_class(void)
+ 				devices_want_va = true;
+ 		}
+ 	}
+-	if (devices_want_pa) {
+-		iova_mode = RTE_IOVA_PA;
+-		if (devices_want_va)
+-			RTE_LOG(WARNING, EAL, "Some devices want 'VA' but forcing 'PA' because other devices want it\n");
+-	} else if (devices_want_va) {
++	if (devices_want_va && !devices_want_pa) {
+ 		iova_mode = RTE_IOVA_VA;
++	} else if (devices_want_pa && !devices_want_va) {
++		iova_mode = RTE_IOVA_PA;
++	} else {
++		iova_mode = RTE_IOVA_DC;
++		if (devices_want_va) {
++			RTE_LOG(WARNING, EAL, "Some devices want 'VA' but forcing 'DC' because other devices want 'PA'.\n");
++			RTE_LOG(WARNING, EAL, "Depending on the final decision by the EAL, not all devices may be able to initialize.\n");
++		}
+ 	}
+ 	return iova_mode;
+ }
+diff --git a/drivers/bus/pci/rte_bus_pci.h b/drivers/bus/pci/rte_bus_pci.h
+index f0d6d81..f0fa3a1 100644
+--- a/drivers/bus/pci/rte_bus_pci.h
++++ b/drivers/bus/pci/rte_bus_pci.h
+@@ -147,8 +147,8 @@ struct rte_pci_bus {
+ #define RTE_PCI_DRV_INTR_RMV 0x0010
+ /** Device driver needs to keep mapped resources if unsupported dev detected */
+ #define RTE_PCI_DRV_KEEP_MAPPED_RES 0x0020
+-/** Device driver supports IOVA as VA */
+-#define RTE_PCI_DRV_IOVA_AS_VA 0X0040
++/** Device driver only supports IOVA as VA and cannot work with IOVA as PA */
++#define RTE_PCI_DRV_IOVA_AS_VA 0x0040
+ 
+ /**
+  * Map the PCI device resources in user space virtual memory address
+diff --git a/drivers/net/atlantic/atl_ethdev.c b/drivers/net/atlantic/atl_ethdev.c
+index 2d05bb4..d3b4b67 100644
+--- a/drivers/net/atlantic/atl_ethdev.c
++++ b/drivers/net/atlantic/atl_ethdev.c
+@@ -155,8 +155,7 @@ static const struct rte_pci_id pci_id_atl_map[] = {
+ 
+ static struct rte_pci_driver rte_atl_pmd = {
+ 	.id_table = pci_id_atl_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_atl_pci_probe,
+ 	.remove = eth_atl_pci_remove,
+ };
+diff --git a/drivers/net/avf/avf_ethdev.c b/drivers/net/avf/avf_ethdev.c
+index 4dc61d9..6dde939 100644
+--- a/drivers/net/avf/avf_ethdev.c
++++ b/drivers/net/avf/avf_ethdev.c
+@@ -1329,8 +1329,7 @@ static int eth_avf_pci_remove(struct rte_pci_device *pci_dev)
+ /* Adaptive virtual function driver struct */
+ static struct rte_pci_driver rte_avf_pmd = {
+ 	.id_table = pci_id_avf_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_avf_pci_probe,
+ 	.remove = eth_avf_pci_remove,
+ };
+diff --git a/drivers/net/bnxt/bnxt_ethdev.c b/drivers/net/bnxt/bnxt_ethdev.c
+index e26b9e3..7e764e0 100644
+--- a/drivers/net/bnxt/bnxt_ethdev.c
++++ b/drivers/net/bnxt/bnxt_ethdev.c
+@@ -3545,8 +3545,7 @@ static int bnxt_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver bnxt_rte_pmd = {
+ 	.id_table = bnxt_pci_id_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING |
+-		RTE_PCI_DRV_INTR_LSC | RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = bnxt_pci_probe,
+ 	.remove = bnxt_pci_remove,
+ };
+diff --git a/drivers/net/e1000/em_ethdev.c b/drivers/net/e1000/em_ethdev.c
+index 8230824..bdee7bc 100644
+--- a/drivers/net/e1000/em_ethdev.c
++++ b/drivers/net/e1000/em_ethdev.c
+@@ -351,8 +351,7 @@ static int eth_em_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver rte_em_pmd = {
+ 	.id_table = pci_id_em_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_em_pci_probe,
+ 	.remove = eth_em_pci_remove,
+ };
+diff --git a/drivers/net/e1000/igb_ethdev.c b/drivers/net/e1000/igb_ethdev.c
+index 87c9aed..7bd0c29 100644
+--- a/drivers/net/e1000/igb_ethdev.c
++++ b/drivers/net/e1000/igb_ethdev.c
+@@ -1113,8 +1113,7 @@ static int eth_igb_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver rte_igb_pmd = {
+ 	.id_table = pci_id_igb_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_igb_pci_probe,
+ 	.remove = eth_igb_pci_remove,
+ };
+@@ -1137,7 +1136,7 @@ static int eth_igbvf_pci_remove(struct rte_pci_device *pci_dev)
+  */
+ static struct rte_pci_driver rte_igbvf_pmd = {
+ 	.id_table = pci_id_igbvf_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING,
+ 	.probe = eth_igbvf_pci_probe,
+ 	.remove = eth_igbvf_pci_remove,
+ };
+diff --git a/drivers/net/enic/enic_ethdev.c b/drivers/net/enic/enic_ethdev.c
+index 996bb55..1b8d74d 100644
+--- a/drivers/net/enic/enic_ethdev.c
++++ b/drivers/net/enic/enic_ethdev.c
+@@ -1077,8 +1077,7 @@ static int eth_enic_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver rte_enic_pmd = {
+ 	.id_table = pci_id_enic_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_enic_pci_probe,
+ 	.remove = eth_enic_pci_remove,
+ };
+diff --git a/drivers/net/fm10k/fm10k_ethdev.c b/drivers/net/fm10k/fm10k_ethdev.c
+index caf4d1b..98583c6 100644
+--- a/drivers/net/fm10k/fm10k_ethdev.c
++++ b/drivers/net/fm10k/fm10k_ethdev.c
+@@ -3258,8 +3258,7 @@ static const struct rte_pci_id pci_id_fm10k_map[] = {
+ 
+ static struct rte_pci_driver rte_pmd_fm10k = {
+ 	.id_table = pci_id_fm10k_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_fm10k_pci_probe,
+ 	.remove = eth_fm10k_pci_remove,
+ };
+diff --git a/drivers/net/i40e/i40e_ethdev.c b/drivers/net/i40e/i40e_ethdev.c
+index df6eaec..c8d01ac 100644
+--- a/drivers/net/i40e/i40e_ethdev.c
++++ b/drivers/net/i40e/i40e_ethdev.c
+@@ -699,8 +699,7 @@ static int eth_i40e_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver rte_i40e_pmd = {
+ 	.id_table = pci_id_i40e_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_i40e_pci_probe,
+ 	.remove = eth_i40e_pci_remove,
+ };
+diff --git a/drivers/net/i40e/i40e_ethdev_vf.c b/drivers/net/i40e/i40e_ethdev_vf.c
+index 551f6fa..58c1c36 100644
+--- a/drivers/net/i40e/i40e_ethdev_vf.c
++++ b/drivers/net/i40e/i40e_ethdev_vf.c
+@@ -1510,7 +1510,7 @@ static int eth_i40evf_pci_remove(struct rte_pci_device *pci_dev)
+  */
+ static struct rte_pci_driver rte_i40evf_pmd = {
+ 	.id_table = pci_id_i40evf_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING,
+ 	.probe = eth_i40evf_pci_probe,
+ 	.remove = eth_i40evf_pci_remove,
+ };
+diff --git a/drivers/net/ixgbe/ixgbe_ethdev.c b/drivers/net/ixgbe/ixgbe_ethdev.c
+index e9533e5..fca15be 100644
+--- a/drivers/net/ixgbe/ixgbe_ethdev.c
++++ b/drivers/net/ixgbe/ixgbe_ethdev.c
+@@ -1807,8 +1807,7 @@ static int eth_ixgbe_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver rte_ixgbe_pmd = {
+ 	.id_table = pci_id_ixgbe_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_ixgbe_pci_probe,
+ 	.remove = eth_ixgbe_pci_remove,
+ };
+@@ -1830,7 +1829,7 @@ static int eth_ixgbevf_pci_remove(struct rte_pci_device *pci_dev)
+  */
+ static struct rte_pci_driver rte_ixgbevf_pmd = {
+ 	.id_table = pci_id_ixgbevf_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING,
+ 	.probe = eth_ixgbevf_pci_probe,
+ 	.remove = eth_ixgbevf_pci_remove,
+ };
+diff --git a/drivers/net/nfp/nfp_net.c b/drivers/net/nfp/nfp_net.c
+index 68c853c..ddd9d9f 100644
+--- a/drivers/net/nfp/nfp_net.c
++++ b/drivers/net/nfp/nfp_net.c
+@@ -3297,16 +3297,14 @@ static int eth_nfp_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver rte_nfp_net_pf_pmd = {
+ 	.id_table = pci_id_nfp_pf_net_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = nfp_pf_pci_probe,
+ 	.remove = eth_nfp_pci_remove,
+ };
+ 
+ static struct rte_pci_driver rte_nfp_net_vf_pmd = {
+ 	.id_table = pci_id_nfp_vf_net_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = eth_nfp_pci_probe,
+ 	.remove = eth_nfp_pci_remove,
+ };
+diff --git a/drivers/net/qede/qede_ethdev.c b/drivers/net/qede/qede_ethdev.c
+index 0b2f305..518673d 100644
+--- a/drivers/net/qede/qede_ethdev.c
++++ b/drivers/net/qede/qede_ethdev.c
+@@ -2735,8 +2735,7 @@ static int qedevf_eth_dev_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver rte_qedevf_pmd = {
+ 	.id_table = pci_id_qedevf_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = qedevf_eth_dev_pci_probe,
+ 	.remove = qedevf_eth_dev_pci_remove,
+ };
+@@ -2755,8 +2754,7 @@ static int qede_eth_dev_pci_remove(struct rte_pci_device *pci_dev)
+ 
+ static struct rte_pci_driver rte_qede_pmd = {
+ 	.id_table = pci_id_qede_map,
+-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+-		     RTE_PCI_DRV_IOVA_AS_VA,
++	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+ 	.probe = qede_eth_dev_pci_probe,
+ 	.remove = qede_eth_dev_pci_remove,
+ };
+diff --git a/lib/librte_eal/common/eal_common_bus.c b/lib/librte_eal/common/eal_common_bus.c
+index 77f1be1..0459048 100644
+--- a/lib/librte_eal/common/eal_common_bus.c
++++ b/lib/librte_eal/common/eal_common_bus.c
+@@ -228,13 +228,37 @@ rte_bus_find_by_device_name(const char *str)
+ enum rte_iova_mode
+ rte_bus_get_iommu_class(void)
+ {
+-	int mode = RTE_IOVA_DC;
++	enum rte_iova_mode mode = RTE_IOVA_DC;
++	bool buses_want_va = false;
++	bool buses_want_pa = false;
+ 	struct rte_bus *bus;
+ 
+ 	TAILQ_FOREACH(bus, &rte_bus_list, next) {
++		enum rte_iova_mode bus_iova_mode;
+ 
+-		if (bus->get_iommu_class)
+-			mode |= bus->get_iommu_class();
++		if (bus->get_iommu_class == NULL)
++			continue;
++
++		bus_iova_mode = bus->get_iommu_class();
++		RTE_LOG(DEBUG, EAL, "Bus %s wants IOVA as '%s'\n",
++			bus->name,
++			bus_iova_mode == RTE_IOVA_DC ? "DC" :
++			(bus_iova_mode == RTE_IOVA_PA ? "PA" : "VA"));
++		if (bus_iova_mode == RTE_IOVA_PA)
++			buses_want_pa = true;
++		else if (bus_iova_mode == RTE_IOVA_VA)
++			buses_want_va = true;
++	}
++	if (buses_want_va && !buses_want_pa) {
++		mode = RTE_IOVA_VA;
++	} else if (buses_want_pa && !buses_want_va) {
++		mode = RTE_IOVA_PA;
++	} else {
++		mode = RTE_IOVA_DC;
++		if (buses_want_va) {
++			RTE_LOG(WARNING, EAL, "Some buses want 'VA' but forcing 'DC' because other buses want 'PA'.\n");
++			RTE_LOG(WARNING, EAL, "Depending on the final decision by the EAL, not all buses may be able to initialize.\n");
++		}
+ 	}
+ 
+ 	return mode;
+-- 
+1.8.3.1
+
