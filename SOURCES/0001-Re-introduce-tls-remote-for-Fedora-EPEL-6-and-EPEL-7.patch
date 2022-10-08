@@ -1,0 +1,202 @@
+From 273d10b74973d672317c0c0bd5e58897e49a94f0 Mon Sep 17 00:00:00 2001
+From: David Sommerseth <davids@openvpn.net>
+Date: Thu, 23 Mar 2017 22:50:41 +0100
+Subject: [PATCH] Re-introduce --tls-remote for Fedora EPEL-6 and EPEL-7 only
+
+This reverts commit 10ce637066f44e8ad9f4af000b8d0c2a4012236d.
+
+To avoid breaking any existing OpenVPN installations using the
+Fedora EPEL repository, this patch re-introduces this DEPRECATED
+--tls-remote option for Fedora EPEL-6 and EPEL-7 ONLY.  This is
+only considered to be an exceptional patch and will not be part
+of any upstream OpenVPN releases.
+
+Signed-off-by: David Sommerseth <davids@openvpn.net>
+---
+ Changes.rst              |  6 ++++++
+ doc/openvpn.8            | 45 +++++++++++++++++++++++++++++++++++++++
+ src/openvpn/options.c    | 55 +++++++++++++++++++++++++++++++++++++++++++-----
+ src/openvpn/ssl_verify.h |  2 ++
+ 4 files changed, 103 insertions(+), 5 deletions(-)
+
+diff --git a/Changes.rst b/Changes.rst
+index d5e12eb..a536f5b 100644
+--- a/Changes.rst
++++ b/Changes.rst
+@@ -179,6 +179,12 @@ https://community.openvpn.net/openvpn/wiki/DeprecatedOptions
+   non-standard X.509 subject formatting must be updated to the standardized
+   formatting.  See the man page for more information.
+ 
++  NOTE: For Fedora EPEL-6 and EPEL-7 this feature have been re-introduced
++  to maintain a possible upgrade path from v2.3 to v2.4.  All users are STRONGLY
++  encouraged to update their configurations to use ``--verify-x509-name`` ASAP.
++  The ``--tls-remote`` option WILL NOT be preserved in newer major Fedora EPEL
++  releases.
++
+ - ``--no-iv`` is deprecated in OpenVPN 2.4 and will be removed in v2.5.
+ 
+ - ``--keysize`` is deprecated in OpenVPN 2.4 and will be removed in v2.6
+diff --git a/doc/openvpn.8 b/doc/openvpn.8
+index 0b3e1ad..44f528c 100644
+--- a/doc/openvpn.8
++++ b/doc/openvpn.8
+@@ -5349,6 +5349,51 @@ prefix will be left as\-is.  This automatic upcasing feature
+ is deprecated and will be removed in a future release.
+ .\"*********************************************************
+ .TP
++.B \-\-tls\-remote name (DEPRECATED)
++Accept connections only from a host with X509 name
++or common name equal to
++.B name.
++The remote host must also pass all other tests
++of verification.
++
++.B NOTE:
++Because tls\-remote may test against a common name prefix,
++only use this option when you are using OpenVPN with a custom CA
++certificate that is under your control.
++Never use this option when your client certificates are signed by
++a third party, such as a commercial web CA.
++
++Name can also be a common name prefix, for example if you
++want a client to only accept connections to "Server-1",
++"Server-2", etc., you can simply use
++.B \-\-tls\-remote Server
++
++Using a common name prefix is a useful alternative to managing
++a CRL (Certificate Revocation List) on the client, since it allows the client
++to refuse all certificates except for those associated
++with designated servers.
++
++.B \-\-tls\-remote
++is a useful replacement for the
++.B \-\-tls\-verify
++option to verify the remote host, because
++.B \-\-tls\-remote
++works in a
++.B \-\-chroot
++environment too.
++
++.B Please also note:
++This option is DEPRECATED.  It has been removed in upstream OpenVPN v2.4.0
++and have only been re-introduced into Fedora EPEL-6 and EPEL-7 for backwards
++compatibility purposes.  It will NOT be provided in any newer major EPEL
++releases.  So please make sure you support the new X.509 name formatting
++described with the
++.B \-\-compat\-names
++option as soon as possible by updating your configurations to use
++.B \-\-verify\-x509\-name
++instead.
++.\"*********************************************************
++.TP
+ .B \-\-verify\-x509\-name name type
+ Accept connections only if a host's X.509 name is equal to
+ .B name.
+diff --git a/src/openvpn/options.c b/src/openvpn/options.c
+index 8dee5d1..2f97442 100644
+--- a/src/openvpn/options.c
++++ b/src/openvpn/options.c
+@@ -66,7 +66,7 @@ const char title_string[] =
+ #ifdef CONFIGURE_GIT_REVISION
+     " [git:" CONFIGURE_GIT_REVISION CONFIGURE_GIT_FLAGS "]"
+ #endif
+-    " " TARGET_ALIAS
++    " " TARGET_ALIAS " [Fedora EPEL patched]"
+ #ifdef ENABLE_CRYPTO
+ #if defined(ENABLE_CRYPTO_MBEDTLS)
+     " [SSL (mbed TLS)]"
+@@ -7887,12 +7887,16 @@ add_option(struct options *options,
+ #endif
+     {
+         VERIFY_PERMISSION(OPT_P_GENERAL);
+-        if (options->verify_x509_type != VERIFY_X509_NONE)
++        if (options->verify_x509_type != VERIFY_X509_NONE
++            && options->verify_x509_type != TLS_REMOTE_SUBJECT_DN
++            && options->verify_x509_type != TLS_REMOTE_SUBJECT_RDN_PREFIX)
+         {
+             msg(msglevel, "you cannot use --compat-names with --verify-x509-name");
+             goto err;
+         }
+-        msg(M_WARN, "DEPRECATED OPTION: --compat-names, please update your configuration. This will be removed in OpenVPN 2.5.");
++        msg(M_WARN, "DEPRECATED OPTION: --compat-names, please update your "
++                    "configuration. This option is especially preserved for "
++                    "Fedora EPEL-6 and EPEL-7 ONLY.");
+         compat_flag(COMPAT_FLAG_SET | COMPAT_NAMES);
+ #if P2MP_SERVER
+         if (p[1] && streq(p[1], "no-remapping"))
+@@ -7903,16 +7907,57 @@ add_option(struct options *options,
+     else if (streq(p[0], "no-name-remapping") && !p[1])
+     {
+         VERIFY_PERMISSION(OPT_P_GENERAL);
+-        if (options->verify_x509_type != VERIFY_X509_NONE)
++        if (options->verify_x509_type != VERIFY_X509_NONE
++            && options->verify_x509_type != TLS_REMOTE_SUBJECT_DN
++            && options->verify_x509_type != TLS_REMOTE_SUBJECT_RDN_PREFIX)
+         {
+             msg(msglevel, "you cannot use --no-name-remapping with --verify-x509-name");
+             goto err;
+         }
+-        msg(M_WARN, "DEPRECATED OPTION: --no-name-remapping, please update your configuration. This will be removed in OpenVPN 2.5.");
++        msg(M_WARN, "DEPRECATED OPTION: --no-name-remapping, please update your "
++                    "configuration. This option is especially preserved for "
++                    "Fedora EPEL-6 and EPEL-7 ONLY.");
+         compat_flag(COMPAT_FLAG_SET | COMPAT_NAMES);
+         compat_flag(COMPAT_FLAG_SET | COMPAT_NO_NAME_REMAPPING);
+ #endif
+     }
++    else if (streq(p[0], "tls-remote") && p[1] && !p[2])
++    {
++        VERIFY_PERMISSION(OPT_P_GENERAL);
++
++        if (options->verify_x509_type != VERIFY_X509_NONE
++            && options->verify_x509_type != TLS_REMOTE_SUBJECT_DN
++            && options->verify_x509_type != TLS_REMOTE_SUBJECT_RDN_PREFIX)
++        {
++            msg(msglevel, "you cannot use --tls-remote with --verify-x509-name");
++            goto err;
++        }
++        msg(M_WARN, "DEPRECATED OPTION: --tls-remote is espectially "
++                    "re-introduced in v2.4 for Fedora EPEL-6 and EPEL-7 only.  "
++                    "Do update your configuration now!");
++
++        if (strlen(p[1]))
++        {
++            int is_username = (!strchr(p[1], '=') || !strstr(p[1], ", "));
++            int type = TLS_REMOTE_SUBJECT_DN;
++            if (p[1][0] != '/' && is_username)
++            {
++                type = TLS_REMOTE_SUBJECT_RDN_PREFIX;
++            }
++
++            /*
++             * Enable legacy openvpn format for DNs that have not been converted
++             * yet and --x509-username-field (not containing an '=' or ', ')
++             */
++            if (p[1][0] == '/' || is_username)
++            {
++                compat_flag(COMPAT_FLAG_SET | COMPAT_NAMES);
++            }
++
++            options->verify_x509_type = type;
++            options->verify_x509_name = p[1];
++        }
++    }
+     else if (streq(p[0], "verify-x509-name") && p[1] && strlen(p[1]) && !p[3])
+     {
+         int type = VERIFY_X509_SUBJECT_DN;
+diff --git a/src/openvpn/ssl_verify.h b/src/openvpn/ssl_verify.h
+index f2d0d6c..e244566 100644
+--- a/src/openvpn/ssl_verify.h
++++ b/src/openvpn/ssl_verify.h
+@@ -66,6 +66,8 @@ struct cert_hash_set {
+ #define VERIFY_X509_SUBJECT_DN          1
+ #define VERIFY_X509_SUBJECT_RDN         2
+ #define VERIFY_X509_SUBJECT_RDN_PREFIX  3
++#define TLS_REMOTE_SUBJECT_DN           1 + 0x100
++#define TLS_REMOTE_SUBJECT_RDN_PREFIX   3 + 0x100
+ 
+ #define TLS_AUTHENTICATION_SUCCEEDED  0
+ #define TLS_AUTHENTICATION_FAILED     1
+-- 
+2.13.5
+

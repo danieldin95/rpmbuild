@@ -1,0 +1,9 @@
+diff --git a/distro/systemd/tmpfiles-openvpn.conf b/distro/systemd/tmpfiles-openvpn.conf
+index bb79671e..9258f5c6 100644
+--- a/distro/systemd/tmpfiles-openvpn.conf
++++ b/distro/systemd/tmpfiles-openvpn.conf
+@@ -1,2 +1,2 @@
+-d /run/openvpn-client 0710 root root -
+-d /run/openvpn-server 0710 root root -
++d /run/openvpn-client 0750 root openvpn -
++d /run/openvpn-server 0750 root openvpn -
