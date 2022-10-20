@@ -225,7 +225,8 @@ URL: https://libvirt.org/
 %endif
 Source: https://libvirt.org/sources/%{?mainturl}libvirt-%{version}.tar.xz
 
-Patch0:   libvirt-5.3.0-chain-append.patch 
+Patch0:   libvirt-5.3.0-chain-append.patch
+Patch1:   libvirt-5.3.0-allow-forward-to-bridge-for-nat.patch
 Requires: libvirt-daemon = %{version}-%{release}
 Requires: libvirt-daemon-config-network = %{version}-%{release}
 Requires: libvirt-daemon-config-nwfilter = %{version}-%{release}
